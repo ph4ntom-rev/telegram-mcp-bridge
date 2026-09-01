@@ -1,63 +1,63 @@
 # Security Guide
 
-Этот мост передает недоверенный Telegram-контент агенту с MCP-доступом. Безопасность зависит не только от кода, но и от правильных allowlist, хранения секретов и сетевой границы.
+This bridge passes untrusted Telegram content to an MCP-enabled agent. Security depends on the code, correct allowlists, secure credential storage, and a properly configured network boundary.
 
-## Секреты
+## Secrets
 
-- `TELEGRAM_BOT_TOKEN`, `MCP_AUTH_TOKEN` и `TELEGRAM_WEBHOOK_SECRET` должны быть независимыми случайными значениями.
-- Храните их в secret manager или локальном `.env` с доступом только владельцу; никогда не передавайте token в аргументах процесса, URL reverse proxy, issue или логах.
-- Для HTTP-профиля используйте не менее 32 случайных URL-safe символов для каждого из двух служебных секретов.
-- Не используйте Telegram username для авторизации: только числовые user/chat ID.
+- `TELEGRAM_BOT_TOKEN`, `MCP_AUTH_TOKEN`, and `TELEGRAM_WEBHOOK_SECRET` must be independent random values.
+- Store them in a secret manager or an owner-only local `.env`. Never expose a token in process arguments, reverse-proxy URLs, issues, or logs.
+- For the HTTP profile, use at least 32 random URL-safe characters for each service secret.
+- Never authorize by Telegram username; use numeric user and chat IDs only.
 
-Если bot token раскрыт, немедленно отзовите его через `@BotFather`, выдайте новый, остановите старый bridge, обновите secret и запустите новый экземпляр. При утечке MCP/webhook secret замените соответствующее значение и перезапустите bridge/reverse proxy. Старую базу можно сохранить: пространство dedup привязано к необратимому короткому SHA-256 namespace token, а не к самому token.
+If the bot token is exposed, revoke it immediately through `@BotFather`, issue a new token, stop the old bridge, update the secret, and start a new instance. If an MCP or webhook secret is exposed, replace that value and restart the bridge and reverse proxy. The existing database may be retained: deduplication is namespaced by a short irreversible SHA-256 token digest, not the token itself.
 
-## Модель разрешений
+## Authorization model
 
-- `TELEGRAM_ALLOWED_USER_IDS` разрешает авторов входящих событий.
-- `TELEGRAM_ALLOWED_CHAT_IDS` разрешает входящий чат и является единственным источником outbound-разрешений.
-- Если заданы оба списка, входящее событие должно удовлетворять обоим.
-- `TELEGRAM_ALLOW_ALL=true` открывает только ingress. Он не дает права отправлять в произвольные чаты.
-- Входящее событие не добавляет чат в durable outbound ACL. При удалении chat ID из конфигурации перезапуск атомарно отзывает доступ и помещает незавершенные отправки этого чата в безопасное терминальное состояние.
+- `TELEGRAM_ALLOWED_USER_IDS` authorizes inbound actors.
+- `TELEGRAM_ALLOWED_CHAT_IDS` authorizes inbound chats and is the only source of outbound permissions.
+- If both lists are configured, an inbound event must satisfy both.
+- `TELEGRAM_ALLOW_ALL=true` opens ingress only; it does not grant permission to send to arbitrary chats.
+- An inbound event never adds its chat to the durable outbound ACL. When a chat ID is removed from configuration, restart atomically revokes it and moves unfinished sends for that chat to a safe terminal state.
 
-Выдавайте MCP-доступ агенту с минимальными полномочиями. Telegram-текст имеет метку `untrusted_content`; не позволяйте ему менять system prompt, секреты, allowlist или инициировать действия вне Telegram без отдельной политики агента.
+Grant the agent only the MCP access it needs. Telegram text is marked `untrusted_content`; do not allow it to change system policy, secrets, allowlists, or initiate unrelated external actions without a separate agent policy.
 
-## Локальный профиль
+## Local profile
 
-Предпочтительная конфигурация для Codex — MCP `stdio` и Telegram long polling. Она делает только исходящие HTTPS-соединения и не открывает слушающий порт. Файл `.env`, каталог базы и резервные копии должны принадлежать одному OS-пользователю. На POSIX запускайте с `umask 077`; на Windows ограничьте ACL каталога учетной записью сервиса.
+The preferred Codex setup is MCP over `stdio` with Telegram long polling. It makes outbound HTTPS connections only and opens no listening port. The `.env`, database directory, and backups should belong to one OS account. Use `umask 077` on POSIX; on Windows, restrict directory ACLs to the service account.
 
-## HTTP/webhook профиль
+## HTTP and webhook profile
 
-Перед приложением обязателен reverse proxy:
+A reverse proxy is required in front of the application:
 
-1. TLS 1.2+ с корректным публичным сертификатом.
-2. Фильтрация актуальных Telegram source CIDR по [официальной инструкции](https://core.telegram.org/bots/webhooks) и проверка `X-Telegram-Bot-Api-Secret-Token` приложением.
-3. Явный `Host` allowlist; `Origin` allowlist, если MCP вызывается из браузерного окружения.
-4. Ограничение тела запроса не выше `BRIDGE_MAX_UPDATE_BYTES` и разумные connection/request limits на edge.
-5. MCP endpoint доступен только с `Authorization: Bearer MCP_AUTH_TOKEN`.
-6. Только один worker/process на SQLite-файл. Для нескольких реплик нужна серверная БД и распределенная очередь.
+1. Use TLS 1.2+ with a valid public certificate.
+2. Filter current Telegram source CIDRs according to the [official webhook guide](https://core.telegram.org/bots/webhooks), while the application validates `X-Telegram-Bot-Api-Secret-Token`.
+3. Configure an explicit `Host` allowlist and an `Origin` allowlist if MCP is called from a browser environment.
+4. Limit request bodies to no more than `BRIDGE_MAX_UPDATE_BYTES` and enforce reasonable connection and request limits at the edge.
+5. Expose the MCP endpoint only with `Authorization: Bearer MCP_AUTH_TOKEN`.
+6. Run only one worker/process per SQLite file. Multiple replicas require a server database and distributed queue.
 
-Не публикуйте встроенный Uvicorn напрямую в интернет. В `docker-compose.yml` порт намеренно привязан только к loopback.
+Do not expose the built-in Uvicorn server directly to the internet. `docker-compose.yml` intentionally publishes the application port on loopback only.
 
-## База, backup и восстановление
+## Database, backup, and recovery
 
-- SQLite должен находиться на локальном диске; NFS/SMB и совместное использование volume несколькими процессами не поддерживаются.
-- Используется WAL и `synchronous=FULL`. Не копируйте отдельно `.sqlite3` во время работы: применяйте SQLite Online Backup API или кратко останавливайте сервис и сохраняйте согласованный набор файлов.
-- Шифруйте backup и проверяйте восстановление. В базе находится полный текст сообщений и непрозрачные Telegram `file_id`.
-- ACKed inbox удаляется по retention policy. Outbox tombstones намеренно остаются idempotency ledger; настройте мониторинг размера volume и свободного места.
-- При заполнении очереди webhook отвечает non-2xx, а polling не повышает offset, поэтому Telegram сможет повторить доставку. Освободите место, не удаляя активную БД вручную.
+- Keep SQLite on a local disk. NFS/SMB and sharing one volume between multiple processes are unsupported.
+- The bridge uses WAL and `synchronous=FULL`. Do not copy the `.sqlite3` file alone while the service is running; use the SQLite Online Backup API or briefly stop the service and preserve a consistent file set.
+- Encrypt backups and test restoration. The database contains complete message text and opaque Telegram `file_id` values.
+- Acknowledged inbox rows are removed according to the retention policy. Outbox tombstones intentionally remain as an idempotency ledger; monitor volume size and free disk space.
+- When the queue is full, the webhook returns non-2xx and polling does not advance its offset, allowing Telegram to retry. Free disk or queue capacity without manually deleting the active database.
 
-## Неоднозначная отправка
+## Ambiguous delivery
 
-Telegram Bot API не принимает idempotency key. Если соединение оборвалось после передачи тела запроса, bridge записывает `uncertain` и не повторяет запрос автоматически. Оператор должен проверить чат и только затем либо оставить запись, либо явно переотправить с новым ключом. Автоматический retry `uncertain` способен создать дубликат.
+The Telegram Bot API does not accept idempotency keys. If a connection ends after the request body may have been transmitted, the bridge records `uncertain` and does not retry automatically. An operator must inspect the chat and then either keep the record or explicitly send again with a new key. Automatically retrying an `uncertain` operation can create duplicates.
 
-## Обновления
+## Updates
 
-Перед обновлением:
+Before updating:
 
-1. Проверьте release notes MCP SDK и Telegram Bot API.
-2. Пересоберите `requirements.lock` с hashes в доверенной среде.
-3. Запустите тесты, Ruff, mypy, Bandit и `pip-audit`.
-4. Сделайте согласованный backup базы.
-5. Выполните rolling restart только одной реплики; startup recovery пометит незавершенную сетевую отправку `uncertain`.
+1. Review the MCP SDK and Telegram Bot API release notes.
+2. Rebuild `requirements.lock` with hashes in a trusted environment.
+3. Run the test suite, Ruff, mypy, Bandit, and `pip-audit`.
+4. Create a consistent database backup.
+5. Restart only one replica; startup recovery marks an unfinished network send as `uncertain`.
 
-Подробные проверенные свойства и остаточные риски перечислены в [`AUDIT.md`](AUDIT.md).
+Detailed verified properties and residual risks are listed in [`AUDIT.md`](AUDIT.md).

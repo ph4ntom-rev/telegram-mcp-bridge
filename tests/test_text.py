@@ -21,7 +21,7 @@ def test_prefers_a_nearby_newline_without_losing_it() -> None:
 
 
 def test_plain_unicode_round_trips() -> None:
-    text = ("👩‍💻é🇺🇿 текст " * 700) + "end"
+    text = ("👩‍💻é🇺🇿 text " * 700) + "end"
     chunks = split_text(text)
     assert "".join(chunks) == text
     assert all(len(chunk) <= 4096 for chunk in chunks)

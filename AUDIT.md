@@ -1,81 +1,83 @@
-# Отчет о глубокой проверке
+# Engineering Audit Report
 
-Дата среза: **2026-08-17**  
-Версия: **1.0.0**  
-Область: Python source, MCP surface, Telegram transport, SQLite lifecycle, HTTP/webhook, CLI, конфигурация, зависимости, контейнер и документация.
+Snapshot date: **2026-08-17**
 
-Это инженерный security/reliability audit с независимым повторным чтением кода и adversarial-тестами, а не сертифицированный внешний pentest.
+Version: **1.0.0**
 
-## Что исследовано
+Scope: Python source, MCP surface, Telegram transport, SQLite lifecycle, HTTP/webhook boundary, CLI, configuration, dependencies, container, and documentation.
 
-Архитектура сверена с актуальными первичными источниками:
+This is an engineering security and reliability audit with independent code review and adversarial testing. It is not a certified external penetration test.
 
-- Codex поддерживает локальный MCP `stdio` и remote Streamable HTTP: [OpenAI Codex MCP](https://developers.openai.com/codex/mcp).
-- Реализация использует стабильный Python MCP SDK v2 и stateless HTTP: [официальный MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
-- Семантика update, long polling, webhook secret и Bot API методов проверена по [Telegram Bot API](https://core.telegram.org/bots/api), [webhook guide](https://core.telegram.org/bots/webhooks) и [FAQ/rate limits](https://core.telegram.org/bots/faq).
-- WAL, single-writer и durability trade-off проверены по [SQLite WAL](https://www.sqlite.org/wal.html).
+## Review scope
 
-Выбранный быстрый локальный профиль — `stdio + long polling`: нет публичного порта, persistent HTTP/2-клиент, Telegram long poll до 50 секунд возвращается сразу при событии. Серверный профиль — stateless Streamable HTTP + webhook за TLS proxy.
+The architecture was checked against current primary sources:
+
+- Codex supports local MCP over `stdio` and remote Streamable HTTP: [OpenAI Codex MCP](https://developers.openai.com/codex/mcp).
+- The implementation uses the stable Python MCP SDK v2 and stateless HTTP: [official MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
+- Update semantics, long polling, webhook secrets, and Bot API methods were checked against the [Telegram Bot API](https://core.telegram.org/bots/api), [webhook guide](https://core.telegram.org/bots/webhooks), and [FAQ/rate limits](https://core.telegram.org/bots/faq).
+- WAL, the single-writer model, and durability trade-offs were checked against the [SQLite WAL documentation](https://www.sqlite.org/wal.html).
+
+The selected low-latency local profile is `stdio + long polling`: no public port, a persistent HTTP/2 client, and a Telegram long poll of up to 50 seconds that returns immediately when an event arrives. The server profile uses stateless Streamable HTTP and a webhook behind a TLS proxy.
 
 ## Threat model
 
-Проверялись следующие противники и отказы:
+The audit covered these adversaries and failure modes:
 
-- неизвестный Telegram user/chat, подмена username, событие с несовпадающим вложенным chat ID;
-- prompt injection и чрезмерные/невалидные JSON/Unicode payload;
-- повторные, конфликтующие и пришедшие вне порядка `update_id`;
-- поддельный webhook, слабый secret, DNS rebinding, неверный Host/Origin, body exhaustion;
-- неавторизованный MCP-клиент и попытка вызвать произвольный Bot API/URL/path;
-- утечка bot token через URL, exception chain, access log или Telegram description;
-- timeout/reset/429, неоднозначный результат send, повтор unsafe mutation;
-- crash/cancel во время SQLite transaction, HTTP send, shutdown или lease;
-- два конкурентных claim, restart с еще не истекшим lease, ACL revoke во время send;
-- заполнение очереди/диска и рост idempotency ledger.
+- unknown Telegram users/chats, username impersonation, and events with conflicting nested chat IDs;
+- prompt injection and oversized or malformed JSON/Unicode payloads;
+- duplicate, conflicting, and out-of-order `update_id` values;
+- forged webhooks, weak secrets, DNS rebinding, invalid Host/Origin headers, and body exhaustion;
+- unauthorized MCP clients and attempts to call arbitrary Bot API methods, URLs, or paths;
+- bot-token leakage through URLs, exception chains, access logs, or Telegram error descriptions;
+- timeouts, resets, 429 responses, ambiguous send outcomes, and unsafe mutation retries;
+- crashes or cancellation during SQLite transactions, HTTP sends, shutdown, or leases;
+- concurrent claims, restart with unexpired leases, and ACL revocation during a send;
+- queue/disk exhaustion and unbounded idempotency-ledger growth.
 
-## Подтвержденные свойства
+## Verified properties
 
-| Свойство | Реализация и проверка |
+| Property | Implementation and verification |
 |---|---|
-| Durable ingress | Webhook возвращает 2xx только после commit; polling offset растет только в одной транзакции с insert. |
-| Dedup | Первичный ключ `(bot_key, update_id)`; одинаковый payload дает duplicate, иной fingerprint дает conflict без замены оригинала. |
-| Порядок | Consumer cursor — локальный монотонный `event_id`, а не Telegram `update_id`, который не обязан оставаться последовательным. |
-| Consumer delivery | Atomic claim + opaque batch token + lease + idempotent ack; до ack гарантия at-least-once. |
-| Outbound | Explicit chat ACL, payload fingerprint и обязательный idempotency key. Известный `sent` replay не делает второй HTTP-запрос. |
-| Неоднозначный send | Transport failure после начала запроса и restart активного send переходят в `uncertain`, без скрытого retry. |
-| Конкурентность | Один SQLite writer, `BEGIN IMMEDIATE`, WAL, busy timeout; exact-ID outbox claim выигрывает только у одного worker. |
-| Отзыв доступа | ACL replacement/revoke атомарно блокирует новые claim и quarantines существующий outbox. Ingress никогда не расширяет outbound ACL. |
-| Секреты | Token redaction покрывает URL, exception, raw pattern и server response; HTTP access log отключен. |
-| HTTP boundary | Bearer auth, stateless MCP, Host/Origin protection, webhook secret constant-time, строгий JSON и byte cap. |
-| API surface | Нет generic `call_api`, произвольной загрузки URL/файла, SQL или filesystem path. |
+| Durable ingress | A webhook returns 2xx only after commit; the polling offset advances in the same transaction as the insert. |
+| Deduplication | `(bot_key, update_id)` is the primary key. Identical payloads are duplicates; a different fingerprint is recorded as a conflict without replacing the original. |
+| Ordering | The consumer cursor is the local monotonic `event_id`, not Telegram's `update_id`, which need not remain sequential. |
+| Consumer delivery | Atomic claim, opaque batch token, lease, and idempotent acknowledgement provide at-least-once delivery until ack. |
+| Outbound delivery | Explicit chat ACL, payload fingerprint, and mandatory idempotency key. Replaying a known `sent` record makes no second HTTP request. |
+| Ambiguous send | A transport failure after request transmission begins, or restart during an active send, moves the record to `uncertain` without a hidden retry. |
+| Concurrency | One SQLite writer, `BEGIN IMMEDIATE`, WAL, and busy timeout. Only one worker can win an exact-ID outbox claim. |
+| Access revocation | ACL replacement/revocation atomically blocks new claims and quarantines existing outbox records. Ingress never expands the outbound ACL. |
+| Secret handling | Token redaction covers URLs, exceptions, raw patterns, and server responses; HTTP access logging is disabled. |
+| HTTP boundary | Bearer authentication, stateless MCP, Host/Origin protection, constant-time webhook-secret checks, strict JSON, and a byte limit. |
+| API surface | No generic `call_api`, arbitrary URL/file download, SQL, or caller-supplied filesystem path. |
 
-## Найденные и устраненные дефекты
+## Defects reproduced and fixed
 
-В ходе проверки были воспроизведены и закрыты:
+The review reproduced and closed the following issues:
 
-1. Bot token мог попасть в exception cause/Telegram error description — исключения теперь полностью санитизируются без опасной цепочки.
-2. Невалидный элемент успешного `getUpdates` мог быть молча отброшен — batch теперь отклоняется целиком, offset не меняется.
-3. Unsafe edit/delete/webhook/callback mutation могла автоматически повторяться после неоднозначного исхода — retry ограничен безопасными случаями.
-4. Malformed HTTP 2xx send считался «не отправленным» — после начала запроса это `uncertain`.
-5. Большой `retry_after` не обновлял общий cooldown — rate limiter теперь штрафует все 429.
-6. Несколько актуальных Telegram Bot API update-вариантов не извлекали actor/chat — parser и adversarial matrix расширены.
-7. Пустые allowlist могли пройти fail-open, а OR-политика ослабляла две заданные границы — теперь deny-by-default и пересечение заполненных списков.
-8. Входящий разрешенный user мог навсегда авторизовать произвольный outbound chat — durable write ACL создается только из явной конфигурации.
-9. Удаленный из env chat сохранял старое право в SQLite — startup выполняет атомарный replace/revoke.
-10. Revoked pending/sending outbox мог занимать всю bounded queue — он атомарно переводится в `dead`/`uncertain`.
-11. Cancel во время ожидающего `BEGIN IMMEDIATE` мог оставить orphan transaction; cancel `close()` — worker thread. Оба lifecycle path shielded и проверены failpoint-тестами.
-12. Restart оставлял неистекшие inbox/outbox leases зависшими — startup сразу освобождает inherited inbox и quarantines inherited send.
-13. Финальный `message_id` мог не записаться из-за истекших часов lease — exact current token остается владельцем до атомарного recovery/reclaim.
-14. Webhook оставался активен в polling/disabled mode — route теперь вообще не монтируется вне webhook mode, а любой заданный secret валидируется.
-15. `doctor` запускал mutable crash recovery рядом с живым server — диагностика теперь только открывает хранилище для чтения состояния и не меняет leases/ACL.
-16. Второй server process с той же БД мог ошибочно выполнить crash recovery живого первого — cross-platform advisory lock теперь берется до открытия/восстановления и освобождается только после cancellation-safe shutdown.
-17. JSON `NaN`/`Infinity`, duplicate keys, reserved webhook path, unsafe host/auth characters и относительный DB path получили строгую валидацию.
-18. Разбиение текста могло повредить Unicode grapheme — plain-text chunking проверен на emoji, ZWJ и combining sequences.
+1. A bot token could reach an exception cause or Telegram error description; errors are now sanitized without preserving a dangerous chain.
+2. A malformed item in a successful `getUpdates` response could be silently discarded; the entire batch is now rejected and the offset remains unchanged.
+3. Unsafe edit/delete/webhook/callback mutations could be retried after an ambiguous outcome; retries are now limited to safe cases.
+4. A malformed HTTP 2xx send response was treated as not sent; after transmission starts, it is now `uncertain`.
+5. A large `retry_after` did not update the global cooldown; all 429 responses now penalize the rate limiter.
+6. Several current Telegram Bot API update variants did not expose actor/chat data; the parser and adversarial matrix were expanded.
+7. Empty allowlists could fail open, while OR semantics weakened two configured boundaries; the policy is now deny-by-default and intersects populated lists.
+8. An authorized inbound user could permanently authorize an arbitrary outbound chat; durable write ACL entries now come only from explicit configuration.
+9. A chat removed from the environment retained stale SQLite permissions; startup now performs atomic replacement and revocation.
+10. Revoked pending/sending outbox rows could consume the bounded queue; they now move atomically to `dead` or `uncertain`.
+11. Cancellation while waiting for `BEGIN IMMEDIATE` could leave an orphan transaction, and cancellation of `close()` could strand a worker thread. Both lifecycle paths are shielded and covered by failpoint tests.
+12. Restart left unexpired inbox/outbox leases stuck; startup immediately releases inherited inbox leases and quarantines inherited sends.
+13. The final `message_id` could be lost after a long lease expired; the exact current token remains the owner until atomic recovery/reclaim.
+14. The webhook route remained active in polling/disabled mode; it is now mounted only in webhook mode, and every configured secret is validated.
+15. `doctor` ran mutable crash recovery next to a live server; diagnostics now open only the resources required to read status and do not mutate leases or ACLs.
+16. A second process sharing the same database could run crash recovery against the live first process; a cross-platform advisory lock is now acquired before open/recovery and released only after cancellation-safe shutdown.
+17. JSON `NaN`/`Infinity`, duplicate keys, reserved webhook paths, unsafe host/auth characters, and relative database paths now receive strict validation.
+18. Text splitting could break a Unicode grapheme; plain-text chunking is tested with emoji, ZWJ, combining sequences, and multiple scripts.
 
-## Верификация
+## Verification
 
-Повторный независимый предрелизный прогон выполнен **2026-09-01** на Python 3.10.6. Результаты совпали с исходным аудитом; дополнительно добавлен CI для Python 3.10/3.12 и проверена чистота публикуемого дерева на секреты.
+An independent pre-release verification was repeated on **2026-09-01** with Python 3.10.6. Results matched the original audit. CI for Python 3.10/3.12 and a secret scan of the publishable tree were also added.
 
-Финальный clean-room прогон выполняется из отдельного virtual environment:
+The final clean-room results were:
 
 ```text
 pytest --cov --cov-branch: 201 passed, branch coverage 85.50%
@@ -83,33 +85,33 @@ ruff check .: clean
 ruff format --check .: clean
 mypy --strict src/telegram_mcp: clean (15 modules)
 pip check: clean
-pip-audit --local --skip-editable: no known vulnerabilities
+pip-audit --require-hashes -r requirements.lock: no known vulnerabilities
 bandit -c pyproject.toml -r src: no unsuppressed findings; generated-placeholder SQL reviewed manually
 wheel build + install in fresh venv + CLI/import smoke: passed
-Docker Compose YAML/config: parsed; фактическая сборка image не выполнялась, потому что Docker отсутствует в среде аудита
+Docker Compose YAML/config: parsed; image build not performed because Docker was unavailable in the audit environment
 ```
 
-Тестовая матрица включает dedup/conflict, две SQLite connections, 20 конкурентных exact-ID claims, expired/restarted leases, cancellation failpoints, ACL revoke, idempotency conflict/replay, ambiguous send, 429 cooldown, Telegram schema variants, hostile JSON/Unicode, webhook auth/mode, MCP auth/metadata, runtime lifecycle, CLI и logging redaction.
+The test matrix covers deduplication/conflicts, two SQLite connections, 20 concurrent exact-ID claims, expired/restarted leases, cancellation failpoints, ACL revocation, idempotency conflict/replay, ambiguous sends, 429 cooldown, Telegram schema variants, hostile JSON/Unicode, webhook auth/mode, MCP auth/metadata, runtime lifecycle, CLI, and log redaction.
 
 ### Synthetic latency
 
-Windows, SQLite `WAL + synchronous=FULL`, 500 итераций, без Telegram network и model latency:
+Windows, SQLite `WAL + synchronous=FULL`, 500 iterations, excluding Telegram network and model latency:
 
-| Операция | p50 | p95 | p99 | mean |
+| Operation | p50 | p95 | p99 | Mean |
 |---|---:|---:|---:|---:|
 | Durable ingest | 1.515 ms | 1.856 ms | 1.974 ms | 1.566 ms |
-| Claim + ACK | 2.619 ms | 3.249 ms | 3.599 ms | 2.724 ms |
-| Полный durable round trip | 4.168 ms | 5.018 ms | 5.436 ms | 4.290 ms |
+| Claim + acknowledgement | 2.619 ms | 3.249 ms | 3.599 ms | 2.724 ms |
+| Full durable round trip | 4.168 ms | 5.018 ms | 5.436 ms | 4.290 ms |
 
-Это измеряет только собственный overhead моста. Фактическое время ответа включает Telegram transport и работу модели. Long polling не ждет окончания timeout при появлении update.
+This measures only the bridge's own overhead. Actual response time includes Telegram transport and model work. Long polling returns immediately when an update arrives rather than waiting for the timeout.
 
-## Остаточные ограничения
+## Residual limitations
 
-- Абсолютная exactly-once отправка невозможна без idempotency primitive со стороны Telegram. `uncertain` требует проверки человеком/агентом.
-- MCP пассивен: остановленную задачу Codex сервер сам не пробудит. Для 24/7 нужен постоянно работающий agent loop.
-- SQLite-профиль рассчитан на один process и локальный диск. Горизонтальное масштабирование требует другой durable coordination layer.
-- Outbox tombstones автоматически не удаляются, иначе старые idempotency keys снова смогут отправиться. Нужен disk monitoring и осознанная retention policy.
-- Poison inbox event при постоянном release может голодать очередь; оператор должен ACK/разобрать его, а не бесконечно освобождать.
-- Вложения доступны только как проверенные метаданные/`file_id`; download pipeline намеренно не входит в эту версию.
-- TLS, Telegram source-CIDR filtering, DDoS protection и backup scheduling остаются обязанностью внешней инфраструктуры.
-- Ни тесты, ни статический анализ не доказывают отсутствие всех дефектов; после обновления SDK/Bot API аудит следует повторить.
+- Absolute exactly-once delivery is impossible without an idempotency primitive from Telegram. An `uncertain` record requires human or agent inspection.
+- MCP is passive and cannot wake a stopped Codex task. An always-on agent loop is required for 24/7 operation.
+- The SQLite profile supports one process on a local disk. Horizontal scaling requires a different durable coordination layer.
+- Outbox tombstones are not deleted automatically because doing so would allow old idempotency keys to send again. Disk monitoring and a deliberate retention policy are required.
+- Repeatedly releasing a poison inbox event can starve the queue; an operator must inspect and acknowledge it instead of releasing it indefinitely.
+- Attachments are available only as validated metadata and opaque `file_id` values; a download pipeline is intentionally outside this release.
+- TLS, Telegram source-CIDR filtering, DDoS protection, and backup scheduling remain infrastructure responsibilities.
+- Tests and static analysis cannot prove the absence of every defect. Repeat the audit after significant SDK or Bot API updates.
