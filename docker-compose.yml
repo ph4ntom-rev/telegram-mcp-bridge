@@ -1,0 +1,29 @@
+services:
+  bridge:
+    build:
+      context: .
+    image: telegram-mcp-bridge:1.0.0
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BRIDGE_TRANSPORT: http
+      TELEGRAM_INGRESS_MODE: webhook
+      MCP_HOST: 0.0.0.0
+      BRIDGE_DATABASE_PATH: /data/bridge.sqlite3
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - bridge-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+
+volumes:
+  bridge-data:

@@ -1,0 +1,18 @@
+# Local stdio profile. Replace every absolute path.
+[mcp_servers.telegram]
+command = "C:\\absolute\\path\\telegram-mcp-bridge\\.venv\\Scripts\\telegram-mcp.exe"
+args = ["serve", "--transport", "stdio", "--env-file", "C:\\absolute\\path\\telegram-mcp-bridge\\.env"]
+startup_timeout_sec = 15
+tool_timeout_sec = 45
+required = true
+default_tools_approval_mode = "writes"
+
+# Remote profile (use this table instead of the stdio table above).
+# [mcp_servers.telegram]
+# url = "https://bridge.example.com/mcp"
+# bearer_token_env_var = "TELEGRAM_MCP_AUTH_TOKEN"
+# startup_timeout_sec = 15
+# tool_timeout_sec = 45
+# required = true
+# default_tools_approval_mode = "writes"
+

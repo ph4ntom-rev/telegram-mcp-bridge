@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "telegram-mcp-bridge"
+version = "1.0.0"
+description = "Low-latency, durable and secure MCP bridge for the Telegram Bot API"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ph4ntom-rev" }]
+keywords = ["telegram", "mcp", "model-context-protocol", "codex", "bot"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Communications :: Chat",
+]
+dependencies = [
+  "aiosqlite==0.22.1",
+  "httpx[http2]==0.28.1",
+  "mcp==2.0.0",
+  "python-dotenv==1.2.3",
+  "regex==2026.7.19",
+  "starlette==1.6.0",
+  "uvicorn[standard]==0.52.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/ph4ntom-rev/telegram-mcp-bridge"
+Repository = "https://github.com/ph4ntom-rev/telegram-mcp-bridge"
+Issues = "https://github.com/ph4ntom-rev/telegram-mcp-bridge/issues"
+Security = "https://github.com/ph4ntom-rev/telegram-mcp-bridge/security/policy"
+
+[project.optional-dependencies]
+dev = [
+  "bandit==1.9.4",
+  "mypy==2.3.1",
+  "pip-audit==2.10.1",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.3.0",
+  "pytest-cov==7.0.0",
+  "ruff==0.16.3",
+]
+
+[project.scripts]
+telegram-mcp = "telegram_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/telegram_mcp"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["telegram_mcp"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 85
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "RUF"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+packages = ["telegram_mcp"]
+
+[tool.bandit]
+# Every dynamic fragment is either a generated sequence of '?' placeholders
+# or an internal Literal column name; all data values remain bound parameters.
+skips = ["B608"]
