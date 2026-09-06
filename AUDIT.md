@@ -93,6 +93,12 @@ Docker Compose YAML/config: parsed; image build not performed because Docker was
 
 The test matrix covers deduplication/conflicts, two SQLite connections, 20 concurrent exact-ID claims, expired/restarted leases, cancellation failpoints, ACL revocation, idempotency conflict/replay, ambiguous sends, 429 cooldown, Telegram schema variants, hostile JSON/Unicode, webhook auth/mode, MCP auth/metadata, runtime lifecycle, CLI, and log redaction.
 
+### Queue operations update (2026-09-06)
+
+Local Windows/Python 3.10.6 verification after the schema-2 changes: 217 tests pass with 85.99% combined statement/branch coverage. Lint, formatting, strict types, environment consistency, Bandit and the hash-locked dependency audit pass. The additional tests cover poison-event quarantine without queue starvation, two-connection claims, live/stale leases, bot-scoped manual outcomes, full backup restoration, failed/cancelled backups, version-1 migration, SQLite FULL rollback and abrupt subprocess termination. No real Telegram messages are sent.
+
+The production-image smoke script also passes locally against the installed dependencies, checking HTTP MCP authentication, lifecycle, quarantine and snapshot restore. Docker itself is unavailable locally; a new CI job builds the production image and runs that script as the image's non-root user with networking disabled. The matrix now includes Windows and macOS. See [operational procedures](OPERATIONS.md).
+
 ### Synthetic latency
 
 Windows, SQLite `WAL + synchronous=FULL`, 500 iterations, excluding Telegram network and model latency:
@@ -111,7 +117,7 @@ This measures only the bridge's own overhead. Actual response time includes Tele
 - MCP is passive and cannot wake a stopped Codex task. An always-on agent loop is required for 24/7 operation.
 - The SQLite profile supports one process on a local disk. Horizontal scaling requires a different durable coordination layer.
 - Outbox tombstones are not deleted automatically because doing so would allow old idempotency keys to send again. Disk monitoring and a deliberate retention policy are required.
-- Repeatedly releasing a poison inbox event can starve the queue; an operator must inspect and acknowledge it instead of releasing it indefinitely.
+- Repeatedly unacknowledged events enter durable quarantine after a bounded delivery budget. They still consume queue capacity and require explicit operator requeue or discard.
 - Attachments are available only as validated metadata and opaque `file_id` values; a download pipeline is intentionally outside this release.
 - TLS, Telegram source-CIDR filtering, DDoS protection, and backup scheduling remain infrastructure responsibilities.
 - Tests and static analysis cannot prove the absence of every defect. Repeat the audit after significant SDK or Bot API updates.

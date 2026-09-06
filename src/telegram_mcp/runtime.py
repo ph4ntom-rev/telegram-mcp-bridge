@@ -52,6 +52,7 @@ class BridgeRuntime:
             settings.database_path,
             max_queue_events=settings.max_queue_events,
             max_claim_events=settings.max_claim_events,
+            max_delivery_attempts=settings.max_delivery_attempts,
             max_payload_bytes=settings.max_update_bytes,
             synchronous=settings.sqlite_synchronous,  # type: ignore[arg-type]
         )

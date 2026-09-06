@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
 import time
@@ -38,7 +39,7 @@ _BOT_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _METHOD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 _MAX_SQLITE_INTEGER = (1 << 63) - 1
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _TERMINAL_OUTBOX = frozenset({"sent", "dead"})
 MAX_LEASE_SECONDS = 86_400.0
 
@@ -386,6 +387,7 @@ class SQLiteStorage:
         *,
         max_queue_events: int = 100_000,
         max_claim_events: int = 50,
+        max_delivery_attempts: int = 5,
         max_outbox_events: int | None = None,
         max_payload_bytes: int = 1_048_576,
         synchronous: Literal["FULL", "EXTRA", "NORMAL"] = "FULL",
@@ -396,6 +398,8 @@ class SQLiteStorage:
             raise ValueError("max_queue_events must be positive")
         if max_claim_events <= 0 or max_claim_events > 500:
             raise ValueError("max_claim_events must be between 1 and 500")
+        if type(max_delivery_attempts) is not int or not 1 <= max_delivery_attempts <= 100:
+            raise ValueError("max_delivery_attempts must be between 1 and 100")
         if max_outbox_events is not None and max_outbox_events <= 0:
             raise ValueError("max_outbox_events must be positive")
         if max_payload_bytes <= 0:
@@ -407,6 +411,7 @@ class SQLiteStorage:
         self.path = Path(path)
         self.max_queue_events = max_queue_events
         self.max_claim_events = max_claim_events
+        self.max_delivery_attempts = max_delivery_attempts
         self.max_outbox_events = max_outbox_events or max_queue_events
         self.max_payload_bytes = max_payload_bytes
         self.synchronous = synchronous
@@ -463,6 +468,16 @@ class SQLiteStorage:
                     raise StorageError("Database schema is newer than this bridge")
                 if version == 0:
                     await connection.executescript(self._schema_sql())
+                if version in (0, 1):
+                    await connection.executescript("""
+                        BEGIN IMMEDIATE;
+                        CREATE TABLE IF NOT EXISTS inbox_quarantine (
+                            event_id INTEGER PRIMARY KEY REFERENCES inbox_events(event_id) ON DELETE CASCADE,
+                            quarantined_at REAL NOT NULL
+                        );
+                        PRAGMA user_version=2;
+                        COMMIT;
+                    """)
                 elif version != _SCHEMA_VERSION:
                     raise StorageError("Unsupported database schema version")
             except BaseException:
@@ -988,6 +1003,185 @@ class SQLiteStorage:
             acked_at=float(row["acked_at"]) if row["acked_at"] is not None else None,
         )
 
+    async def _quarantine_exhausted_inbox(self, bot_key: str, timestamp: float) -> None:
+        """Run inside the claim transaction; never interrupt a live consumer lease."""
+        cursor = await self._conn().execute(
+            """
+            INSERT OR IGNORE INTO inbox_quarantine(event_id, quarantined_at)
+            SELECT event_id, ? FROM inbox_events
+            WHERE bot_key = ? AND attempts >= ?
+              AND (state = 'queued' OR (state = 'leased' AND lease_until <= ?))
+            """,
+            (timestamp, bot_key, self.max_delivery_attempts, timestamp),
+        )
+        count = cursor.rowcount
+        await cursor.close()
+        if count:
+            await self._conn().execute(
+                """
+                UPDATE inbox_events SET state = 'queued', lease_token = NULL, lease_until = NULL
+                WHERE bot_key = ? AND event_id IN (SELECT event_id FROM inbox_quarantine)
+                """,
+                (bot_key,),
+            )
+            await self._counter(bot_key, "inbox_quarantined", count)
+
+    async def review_queue(self, bot_key: str, *, limit: int = 50) -> dict[str, Any]:
+        """Bounded operator metadata; no message bodies, credentials or lease tokens."""
+        bot_key = _validate_bot_key(bot_key)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        async with self._lock:
+            quarantined = await self._fetchall(
+                """
+                SELECT e.event_id, e.update_id, e.attempts, q.quarantined_at
+                FROM inbox_events e JOIN inbox_quarantine q ON q.event_id = e.event_id
+                WHERE e.bot_key = ? ORDER BY e.event_id LIMIT ?
+                """,
+                (bot_key, limit),
+            )
+            uncertain = await self._fetchall(
+                """
+                SELECT outbox_id, chat_id, fingerprint, attempts, updated_at
+                FROM outbox WHERE bot_key = ? AND status = 'uncertain'
+                ORDER BY outbox_id LIMIT ?
+                """,
+                (bot_key, limit),
+            )
+            return {
+                "quarantined_inbox": [dict(row) for row in quarantined],
+                "uncertain_outbox": [dict(row) for row in uncertain],
+                "limit": limit,
+            }
+
+    async def resolve_quarantine(
+        self,
+        bot_key: str,
+        event_id: int,
+        *,
+        action: Literal["requeue", "discard"],
+        now: float | None = None,
+    ) -> None:
+        bot_key = _validate_bot_key(bot_key)
+        event_id = _validate_integer(event_id, "event_id", non_negative=True)
+        if action not in ("requeue", "discard"):
+            raise ValueError("action must be requeue or discard")
+        timestamp = self._now(now)
+        async with self._lock:
+            try:
+                await self._begin()
+                row = await self._fetchone(
+                    """
+                    SELECT e.event_id FROM inbox_events e
+                    JOIN inbox_quarantine q ON e.event_id = q.event_id
+                    WHERE e.bot_key = ? AND e.event_id = ? AND e.state = 'queued'
+                    """,
+                    (bot_key, event_id),
+                )
+                if row is None:
+                    raise StorageError("No quarantined event for this bot and ID")
+                await self._conn().execute(
+                    """
+                    UPDATE inbox_events SET state = ?, attempts = 0, acked_at = ?
+                    WHERE event_id = ?
+                    """,
+                    (
+                        "queued" if action == "requeue" else "acked",
+                        None if action == "requeue" else timestamp,
+                        event_id,
+                    ),
+                )
+                await self._conn().execute("DELETE FROM inbox_quarantine WHERE event_id = ?", (event_id,))
+                await self._counter(bot_key, "inbox_operator_" + action)
+                await self._commit()
+            except BaseException:
+                await self._rollback()
+                raise
+
+    async def resolve_uncertain(
+        self,
+        bot_key: str,
+        outbox_id: int,
+        *,
+        telegram_message_id: int | None = None,
+        discard: bool = False,
+        now: float | None = None,
+    ) -> None:
+        """Record an operator's external confirmation without making a Telegram request."""
+        bot_key = _validate_bot_key(bot_key)
+        outbox_id = _validate_integer(outbox_id, "outbox_id", non_negative=True)
+        if type(discard) is not bool or discard == (telegram_message_id is not None):
+            raise ValueError("Choose either a confirmed Telegram message ID or discard")
+        if telegram_message_id is not None:
+            telegram_message_id = _validate_integer(
+                telegram_message_id, "telegram_message_id", non_negative=True
+            )
+            if telegram_message_id == 0:
+                raise ValueError("telegram_message_id must be positive")
+        timestamp = self._now(now)
+        async with self._lock:
+            try:
+                await self._begin()
+                cursor = await self._conn().execute(
+                    """
+                    UPDATE outbox SET status = ?, telegram_message_id = ?, updated_at = ?, sent_at = ?,
+                        last_error = ?, lease_token = NULL, lease_until = NULL
+                    WHERE bot_key = ? AND outbox_id = ? AND status = 'uncertain'
+                    """,
+                    (
+                        "dead" if discard else "sent",
+                        telegram_message_id,
+                        timestamp,
+                        None if discard else timestamp,
+                        "Operator discarded uncertain delivery" if discard else None,
+                        bot_key,
+                        outbox_id,
+                    ),
+                )
+                changed = cursor.rowcount
+                await cursor.close()
+                if changed != 1:
+                    raise OutboxStateError("Only this bot's uncertain delivery may be resolved")
+                await self._counter(
+                    bot_key, "outbox_operator_discard" if discard else "outbox_operator_confirm"
+                )
+                await self._commit()
+            except BaseException:
+                await self._rollback()
+                raise
+
+    async def backup(self, destination: str | Path) -> dict[str, Any]:
+        """Create a complete SQLite snapshot without overwriting any existing path."""
+        destination = await asyncio.to_thread(Path(destination).absolute)
+
+        async def operation() -> dict[str, Any]:
+            async with self._lock:
+                # O_EXCL also rejects symlinks and a destination equal to the source.
+                descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(descriptor)
+                try:
+                    async with aiosqlite.connect(destination) as target:
+                        await self._conn().backup(target, pages=256)
+                        async with target.execute("PRAGMA integrity_check") as cursor:
+                            rows = await cursor.fetchall()
+                        if [row[0] for row in rows] != ["ok"]:
+                            raise StorageError("Backup integrity check failed")
+                        async with target.execute("PRAGMA foreign_key_check") as cursor:
+                            if await cursor.fetchone() is not None:
+                                raise StorageError("Backup foreign-key check failed")
+                    return {
+                        "ok": True,
+                        "path": str(destination),
+                        "schema_version": _SCHEMA_VERSION,
+                        "scope": "complete database including all bot namespaces and idempotency records",
+                    }
+                except BaseException:
+                    await asyncio.to_thread(destination.unlink, missing_ok=True)
+                    raise
+
+        result: dict[str, Any] = await self._finish(operation)
+        return result
+
     async def claim_events(
         self,
         bot_key: str,
@@ -1008,10 +1202,12 @@ class SQLiteStorage:
         async with self._lock:
             try:
                 await self._begin()
+                await self._quarantine_exhausted_inbox(bot_key, timestamp)
                 rows = await self._fetchall(
                     """
                     SELECT event_id FROM inbox_events
                     WHERE bot_key = ?
+                      AND event_id NOT IN (SELECT event_id FROM inbox_quarantine)
                       AND state IN ('queued', 'leased')
                       AND (state = 'queued' OR lease_until <= ?)
                     ORDER BY event_id
@@ -1101,6 +1297,7 @@ class SQLiteStorage:
                         (bot_key, *ids),
                     )
                     await self._counter(bot_key, "inbox_released", len(ids))
+                    await self._quarantine_exhausted_inbox(bot_key, timestamp)
                 await self._commit()
                 return len(ids)
             except BaseException:
@@ -2023,7 +2220,9 @@ class SQLiteStorage:
         async with self._lock:
             if bot_key is None:
                 inbox_rows = await self._fetchall(
-                    "SELECT state, COUNT(*) AS count FROM inbox_events GROUP BY state"
+                    """SELECT CASE WHEN q.event_id IS NULL THEN e.state ELSE 'quarantined' END AS state,
+                    COUNT(*) AS count FROM inbox_events e
+                    LEFT JOIN inbox_quarantine q ON e.event_id = q.event_id GROUP BY 1"""
                 )
                 outbox_rows = await self._fetchall(
                     "SELECT status, COUNT(*) AS count FROM outbox GROUP BY status"
@@ -2040,8 +2239,10 @@ class SQLiteStorage:
             else:
                 inbox_rows = await self._fetchall(
                     """
-                    SELECT state, COUNT(*) AS count FROM inbox_events
-                    WHERE bot_key = ? GROUP BY state
+                    SELECT CASE WHEN q.event_id IS NULL THEN e.state ELSE 'quarantined' END AS state,
+                    COUNT(*) AS count FROM inbox_events e
+                    LEFT JOIN inbox_quarantine q ON e.event_id = q.event_id
+                    WHERE e.bot_key = ? GROUP BY 1
                     """,
                     (bot_key,),
                 )
@@ -2079,7 +2280,9 @@ class SQLiteStorage:
                 inbox_states=inbox_states,
                 outbox_states=outbox_states,
                 counters=counters,
-                inbox_pending=inbox_states.get("queued", 0) + inbox_states.get("leased", 0),
+                inbox_pending=sum(
+                    inbox_states.get(state, 0) for state in ("queued", "leased", "quarantined")
+                ),
                 outbox_pending=sum(
                     count for state, count in outbox_states.items() if state not in _TERMINAL_OUTBOX
                 ),
