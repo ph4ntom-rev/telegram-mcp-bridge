@@ -13,7 +13,7 @@ A low-latency, durable bridge between the Telegram Bot API and MCP clients such 
 | Local (recommended for Codex) | `stdio` | Long polling | Minimal attack surface, no listening port, and near-immediate event delivery |
 | Server | Stateless Streamable HTTP | HTTPS webhook | An always-on remote service behind a TLS reverse proxy |
 
-SQLite in WAL mode is the source of truth. A webhook returns `200` only after commit, and long polling advances its offset only after a durable insert. The bridge uses a `claim → lease → ack` workflow between the queue and the agent, so incoming events are delivered at least once until acknowledged.
+SQLite in WAL mode is the source of truth. A webhook returns `200` only after commit, and long polling advances its offset only after a durable insert. The bridge uses a `claim → lease → ack` workflow. Incoming events are delivered at least once, with repeatedly unacknowledged events retained in quarantine for operator review.
 
 > MCP cannot wake a stopped Codex task by itself. While an agent is running, it can wait for events with `telegram_wait_updates`. An always-on agent loop or scheduled task is required for autonomous 24/7 responses.
 
@@ -143,7 +143,7 @@ See [`SECURITY.md`](SECURITY.md) for the operational security guide and [`AUDIT.
 .\.venv\Scripts\pip-audit.exe --require-hashes -r requirements.lock
 ```
 
-GitHub Actions runs the same checks on Python 3.10 and 3.12. Runtime dependencies are installed with mandatory SHA-256 verification from `requirements.lock`.
+GitHub Actions checks Linux on Python 3.10/3.12 and Windows/macOS on Python 3.12. It also builds the production Docker image and tests its installed package with networking disabled. Runtime dependencies are installed with mandatory SHA-256 verification from `requirements.lock`.
 
 Run the local synthetic benchmark without contacting Telegram:
 
@@ -155,4 +155,4 @@ Run the local synthetic benchmark without contacting Telegram:
 
 Every configuration variable and its secure default is documented in [`.env.example`](.env.example). Never pass secrets as process arguments or commit `.env`. Terminal outbox records (`sent`, `dead`, and `uncertain`) form the idempotency ledger; monitor disk usage and do not delete them without explicitly accepting the loss of replay protection.
 
-Backup, restore, credential rotation, and incident-response procedures are documented in [`SECURITY.md`](SECURITY.md). Verified behavior and remaining limitations are documented in [`AUDIT.md`](AUDIT.md).
+Use [`OPERATIONS.md`](OPERATIONS.md) for quarantine review, manual resolution of uncertain deliveries, verified backups and schema-2 migration. Operator queue commands run offline and never send Telegram messages. Credential rotation and incident response remain documented in [`SECURITY.md`](SECURITY.md); verified behavior and remaining limitations are in [`AUDIT.md`](AUDIT.md).

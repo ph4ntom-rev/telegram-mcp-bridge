@@ -10,18 +10,28 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   verify:
-    name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.12"]
+        os: [ubuntu-latest]
+        include:
+          - os: windows-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
 
     steps:
       - uses: actions/checkout@v4
@@ -72,10 +82,20 @@ jobs:
         run: python -m pip wheel --no-deps . --wheel-dir wheelhouse
 
       - name: Upload wheel
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
           name: telegram-mcp-bridge-wheel
           path: wheelhouse/*.whl
           if-no-files-found: error
           retention-days: 14
+
+  container:
+    name: Docker runtime without network access
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production image
+        run: docker build -t telegram-bridge-test .
+      - name: Test installed package, HTTP authentication, persistence and backup
+        run: docker run --rm --network none -i --entrypoint python telegram-bridge-test - < tests/docker_smoke.py

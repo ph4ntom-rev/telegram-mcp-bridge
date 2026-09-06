@@ -293,6 +293,10 @@ class BridgeService:
             "outbox": metrics.outbox_states,
             "inbox_pending": metrics.inbox_pending,
             "outbox_pending": metrics.outbox_pending,
+            "attention_required": {
+                "quarantined_inbox": metrics.inbox_states.get("quarantined", 0),
+                "uncertain_outbox": metrics.outbox_states.get("uncertain", 0),
+            },
             "oldest_inbox_age_seconds": metrics.oldest_inbox_age_seconds,
             "oldest_outbox_age_seconds": metrics.oldest_outbox_age_seconds,
         }
@@ -592,6 +596,12 @@ class BridgeService:
             ),
             "replayed": replayed,
             "error": record.last_error if state != "sent" else None,
+            "next_action": (
+                "Inspect Telegram delivery, then use queue resolve-outbox to confirm or discard; "
+                "do not resend blindly"
+                if state == "uncertain"
+                else None
+            ),
         }
 
     async def reply(

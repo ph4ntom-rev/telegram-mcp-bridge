@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -18,9 +19,11 @@ from dotenv import load_dotenv
 from telegram_mcp.app import create_application
 from telegram_mcp.config import Settings
 from telegram_mcp.errors import BridgeError, ConfigurationError
+from telegram_mcp.instance_lock import InstanceLock
 from telegram_mcp.logging_utils import configure_logging, redact_text
 from telegram_mcp.mcp_server import RuntimeFacade, create_mcp_server
 from telegram_mcp.runtime import BridgeRuntime
+from telegram_mcp.storage import SQLiteStorage
 from telegram_mcp.telegram import TelegramClient
 
 _WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
@@ -39,6 +42,26 @@ def _parser() -> argparse.ArgumentParser:
 
     doctor = commands.add_parser("doctor", help="validate configuration and connectivity")
     doctor.add_argument("--env-file", type=Path, default=Path(".env"))
+
+    queue = commands.add_parser("queue", help="offline queue review, resolution and complete backup")
+    queue_commands = queue.add_subparsers(dest="queue_command", required=True)
+    for name in ("inspect", "requeue", "discard", "resolve-outbox", "backup"):
+        operation = queue_commands.add_parser(name)
+        operation.add_argument("--env-file", type=Path, default=Path(".env"))
+        if name == "inspect":
+            operation.add_argument("--limit", type=int, default=50)
+        elif name == "backup":
+            operation.add_argument("destination", type=Path)
+        else:
+            operation.add_argument("id", type=int)
+            if name == "resolve-outbox":
+                choice = operation.add_mutually_exclusive_group(required=True)
+                choice.add_argument(
+                    "--message-id", type=int, help="message ID independently verified in Telegram"
+                )
+                choice.add_argument(
+                    "--discard", action="store_true", help="retain a terminal record without retry"
+                )
 
     webhook = commands.add_parser("webhook", help="manage Telegram webhook registration")
     webhook_commands = webhook.add_subparsers(dest="webhook_command", required=True)
@@ -166,6 +189,32 @@ async def _webhook(settings: Settings, *, action: str, drop_pending: bool) -> di
         await client.close()
 
 
+async def _queue(args: argparse.Namespace, settings: Settings) -> dict[str, Any]:
+    if not settings.database_path.is_file():
+        raise BridgeError("Database does not exist; refusing to create an empty operator database")
+    # No startup recovery, authorization bootstrap, network client or send worker.
+    # Requiring a stopped service also makes administrative resolutions unambiguous.
+    with InstanceLock(settings.database_path):
+        async with SQLiteStorage(settings.database_path) as storage:
+            action = args.queue_command
+            if action == "inspect":
+                return await storage.review_queue(settings.bot_key, limit=args.limit)
+            if action == "backup":
+                return await storage.backup(args.destination)
+            if action in ("requeue", "discard"):
+                await storage.resolve_quarantine(settings.bot_key, args.id, action=action)
+            elif action == "resolve-outbox":
+                await storage.resolve_uncertain(
+                    settings.bot_key,
+                    args.id,
+                    telegram_message_id=args.message_id,
+                    discard=args.discard,
+                )
+            else:
+                raise ValueError("Unknown queue operation")
+            return {"ok": True, "action": action, "id": args.id, "telegram_requests": 0}
+
+
 async def _run(args: argparse.Namespace, settings: Settings) -> None:
     if args.command == "serve":
         if settings.transport == "stdio":
@@ -175,6 +224,9 @@ async def _run(args: argparse.Namespace, settings: Settings) -> None:
         return
     if args.command == "doctor":
         print(json.dumps(await _doctor(settings), ensure_ascii=False, indent=2))
+        return
+    if args.command == "queue":
+        print(json.dumps(await _queue(args, settings), ensure_ascii=False, indent=2))
         return
     if args.command == "webhook":
         result = await _webhook(
@@ -195,6 +247,6 @@ def main() -> None:
         asyncio.run(_run(args, settings))
     except KeyboardInterrupt:
         raise SystemExit(130) from None
-    except (BridgeError, ConfigurationError, ValueError) as exc:
+    except (BridgeError, ConfigurationError, ValueError, OSError, sqlite3.Error) as exc:
         print(f"telegram-mcp: {redact_text(exc)}", file=sys.stderr)
         raise SystemExit(2) from None

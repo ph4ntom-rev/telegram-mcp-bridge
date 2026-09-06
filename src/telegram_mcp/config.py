@@ -109,6 +109,7 @@ class Settings:
     max_update_bytes: int = 1_048_576
     max_queue_events: int = 100_000
     max_claim_events: int = 50
+    max_delivery_attempts: int = 5
     max_wait_seconds: int = 30
     sqlite_synchronous: str = "FULL"
     retention_days: int = 30
@@ -167,6 +168,9 @@ class Settings:
             max_claim_events=_integer(
                 env.get("BRIDGE_MAX_CLAIM_EVENTS"), 50, "BRIDGE_MAX_CLAIM_EVENTS", 1, 500
             ),
+            max_delivery_attempts=_integer(
+                env.get("BRIDGE_MAX_DELIVERY_ATTEMPTS"), 5, "BRIDGE_MAX_DELIVERY_ATTEMPTS", 1, 100
+            ),
             max_wait_seconds=_integer(
                 env.get("BRIDGE_MAX_WAIT_SECONDS"), 30, "BRIDGE_MAX_WAIT_SECONDS", 1, 55
             ),
@@ -192,6 +196,8 @@ class Settings:
         return settings
 
     def validate(self) -> None:
+        if type(self.max_delivery_attempts) is not int or not 1 <= self.max_delivery_attempts <= 100:
+            raise ConfigurationError("BRIDGE_MAX_DELIVERY_ATTEMPTS must be between 1 and 100")
         if self.sqlite_synchronous not in {"FULL", "EXTRA", "NORMAL"}:
             raise ConfigurationError("SQLITE_SYNCHRONOUS must be FULL, EXTRA, or NORMAL")
         if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
