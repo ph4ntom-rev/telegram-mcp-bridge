@@ -83,7 +83,7 @@ jobs:
 
       - name: Upload wheel
         if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: telegram-mcp-bridge-wheel
           path: wheelhouse/*.whl
